@@ -1,0 +1,635 @@
+diff --git a/ms912x.h b/ms912x.h
+index 9dd7f0e..021ecc0 100644
+--- a/ms912x.h
++++ b/ms912x.h
+@@ -123,13 +123,17 @@ struct ms912x_device {
+ 	struct ms912x_custom_mode custom_modes[2];
+ 	unsigned int num_custom_modes;
+ 
+-	struct drm_rect update_rect;
+-
+-	/* Double buffer to allow memcpy and transfer
+-	 * to happen in parallel
+-	 */
+-	int current_request;
+-	struct ms912x_usb_request requests[2];
++	/* Protects shadow*, dirty_rect, sent_rect, fb_width and fb_height */
++	struct mutex shadow_lock;
++	/* XRGB copy of the screen, sent to the device by request.work */
++	void *shadow;
++	bool shadow_valid;
++	struct drm_rect dirty_rect;
++	struct drm_rect sent_rect;
++	int fb_width;
++	int fb_height;
++
++	struct ms912x_usb_request request;
+ };
+ 
+ struct ms912x_request {
+@@ -191,6 +195,9 @@ struct ms912x_custom_timing_record {
+ #define MS912X_MAX_TRANSFER_LEN \
+ 	(MS912X_MAX_WIDTH * MS912X_MAX_HEIGHT * 2 + MS912X_FRAME_OVERHEAD)
+ 
++#define MS912X_SHADOW_PITCH (MS912X_MAX_WIDTH * 4)
++#define MS912X_SHADOW_SIZE (MS912X_SHADOW_PITCH * MS912X_MAX_HEIGHT)
++
+ #define to_ms912x(x) container_of(x, struct ms912x_device, drm)
+ 
+ int ms912x_read_byte(struct ms912x_device *ms912x, u16 address);
+@@ -202,6 +209,7 @@ int ms912x_set_resolution(struct ms912x_device *ms912x,
+ int ms912x_power_on(struct ms912x_device *ms912x);
+ int ms912x_power_off(struct ms912x_device *ms912x);
+ 
++void ms912x_clear_rect(struct drm_rect *rect);
+ int ms912x_fb_send_rect(struct drm_framebuffer *fb, const struct iosys_map *map,
+ 			struct drm_format_conv_state *fmtcnv_state,
+ 			struct drm_rect *rect);
+diff --git a/ms912x_drv.c b/ms912x_drv.c
+index 1986128..23544f6 100644
+--- a/ms912x_drv.c
++++ b/ms912x_drv.c
+@@ -1,11 +1,10 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ 
+-#include <linux/completion.h>
+-#include <linux/limits.h>
+ #include <linux/module.h>
+ #include <linux/mutex.h>
+ #include <linux/pm.h>
+ #include <linux/usb.h>
++#include <linux/vmalloc.h>
+ #include <linux/workqueue.h>
+ 
+ #include <drm/clients/drm_client_setup.h>
+@@ -155,18 +154,6 @@ static void ms912x_crtc_atomic_enable(struct drm_crtc *crtc,
+ 		drm_err(dev, "failed to set display mode: %d\n", ret);
+ }
+ 
+-static void ms912x_cancel_transfer_work(struct ms912x_device *ms912x)
+-{
+-	unsigned int i;
+-
+-	for (i = 0; i < ARRAY_SIZE(ms912x->requests); i++) {
+-		struct ms912x_usb_request *request = &ms912x->requests[i];
+-
+-		if (cancel_work_sync(&request->work))
+-			complete(&request->done);
+-	}
+-}
+-
+ static void ms912x_crtc_atomic_disable(struct drm_crtc *crtc,
+ 				       struct drm_atomic_commit *state)
+ {
+@@ -174,7 +161,7 @@ static void ms912x_crtc_atomic_disable(struct drm_crtc *crtc,
+ 	struct ms912x_device *ms912x = to_ms912x(dev);
+ 	int ret;
+ 
+-	ms912x_cancel_transfer_work(ms912x);
++	cancel_work_sync(&ms912x->request.work);
+ 	ret = ms912x_power_off(ms912x);
+ 	if (ret && ret != -ENODEV)
+ 		drm_err(dev, "failed to power off display: %d\n", ret);
+@@ -220,23 +207,6 @@ static int ms912x_plane_atomic_check(struct drm_plane *plane,
+ 						   false, false);
+ }
+ 
+-static void ms912x_clear_rect(struct drm_rect *rect)
+-{
+-	rect->x1 = INT_MAX;
+-	rect->y1 = INT_MAX;
+-	rect->x2 = 0;
+-	rect->y2 = 0;
+-}
+-
+-static void ms912x_merge_rects(struct drm_rect *dest, struct drm_rect *r1,
+-			       struct drm_rect *r2)
+-{
+-	dest->x1 = min(r1->x1, r2->x1);
+-	dest->y1 = min(r1->y1, r2->y1);
+-	dest->x2 = max(r1->x2, r2->x2);
+-	dest->y2 = max(r1->y2, r2->y2);
+-}
+-
+ static void ms912x_plane_atomic_update(struct drm_plane *plane,
+ 				       struct drm_atomic_commit *state)
+ {
+@@ -245,7 +215,7 @@ static void ms912x_plane_atomic_update(struct drm_plane *plane,
+ 	struct drm_crtc_state *new_crtc_state;
+ 	struct drm_shadow_plane_state *shadow_plane_state;
+ 	struct ms912x_device *ms912x = to_ms912x(plane->dev);
+-	struct drm_rect current_rect, rect;
++	struct drm_rect rect;
+ 
+ 	old_plane_state = drm_atomic_get_old_plane_state(state, plane);
+ 	new_plane_state = drm_atomic_get_new_plane_state(state, plane);
+@@ -257,27 +227,19 @@ static void ms912x_plane_atomic_update(struct drm_plane *plane,
+ 	shadow_plane_state = to_drm_shadow_plane_state(new_plane_state);
+ 
+ 	/* Damage from the previous mode may not fit the new framebuffer. */
+-	if (drm_atomic_crtc_needs_modeset(new_crtc_state))
+-		ms912x_clear_rect(&ms912x->update_rect);
++	if (drm_atomic_crtc_needs_modeset(new_crtc_state)) {
++		mutex_lock(&ms912x->shadow_lock);
++		ms912x_clear_rect(&ms912x->dirty_rect);
++		ms912x_clear_rect(&ms912x->sent_rect);
++		ms912x->shadow_valid = false;
++		mutex_unlock(&ms912x->shadow_lock);
++	}
+ 
+ 	if (drm_atomic_helper_damage_merged(old_plane_state, new_plane_state,
+-					    &current_rect)) {
+-		/*
+-		 * The device double buffers, so we need to send the update
+-		 * rects of the last two frames.
+-		 */
+-		ms912x_merge_rects(&rect, &current_rect, &ms912x->update_rect);
+-		if (ms912x_fb_send_rect(new_plane_state->fb,
+-					&shadow_plane_state->data[0],
+-					&shadow_plane_state->fmtcnv_state,
+-					&rect)) {
+-			/* In case of error, merge the rects to update later */
+-			ms912x_merge_rects(&ms912x->update_rect,
+-					   &ms912x->update_rect, &rect);
+-		} else {
+-			ms912x->update_rect = current_rect;
+-		}
+-	}
++					    &rect))
++		ms912x_fb_send_rect(new_plane_state->fb,
++				    &shadow_plane_state->data[0],
++				    &shadow_plane_state->fmtcnv_state, &rect);
+ }
+ 
+ static const struct drm_crtc_helper_funcs ms912x_crtc_helper_funcs = {
+@@ -334,6 +296,9 @@ static int ms912x_usb_probe(struct usb_interface *interface,
+ 
+ 	ms912x->intf = interface;
+ 	ret = devm_mutex_init(&interface->dev, &ms912x->ctrl_lock);
++	if (ret)
++		return ret;
++	ret = devm_mutex_init(&interface->dev, &ms912x->shadow_lock);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -387,15 +352,14 @@ static int ms912x_usb_probe(struct usb_interface *interface,
+ 	if (IS_ERR(ms912x->workqueue))
+ 		return PTR_ERR(ms912x->workqueue);
+ 
+-	ret = ms912x_init_request(ms912x, &ms912x->requests[0],
+-				  MS912X_MAX_TRANSFER_LEN);
+-	if (ret)
+-		return ret;
++	ms912x->shadow = vzalloc(MS912X_SHADOW_SIZE);
++	if (!ms912x->shadow)
++		return -ENOMEM;
+ 
+-	ret = ms912x_init_request(ms912x, &ms912x->requests[1],
++	ret = ms912x_init_request(ms912x, &ms912x->request,
+ 				  MS912X_MAX_TRANSFER_LEN);
+ 	if (ret)
+-		goto err_free_request_0;
++		goto err_free_shadow;
+ 
+ 	ret = drm_universal_plane_init(dev, &ms912x->plane, 0,
+ 				       &ms912x_plane_funcs,
+@@ -403,22 +367,23 @@ static int ms912x_usb_probe(struct usb_interface *interface,
+ 				       ARRAY_SIZE(ms912x_plane_formats), NULL,
+ 				       DRM_PLANE_TYPE_PRIMARY, NULL);
+ 	if (ret)
+-		goto err_free_request_1;
++		goto err_free_request;
+ 
+ 	drm_plane_helper_add(&ms912x->plane, &ms912x_plane_helper_funcs);
+ 	drm_plane_enable_fb_damage_clips(&ms912x->plane);
+-	ms912x_clear_rect(&ms912x->update_rect);
++	ms912x_clear_rect(&ms912x->dirty_rect);
++	ms912x_clear_rect(&ms912x->sent_rect);
+ 
+ 	ret = drm_crtc_init_with_planes(dev, &ms912x->crtc, &ms912x->plane,
+ 					NULL, &ms912x_crtc_funcs, NULL);
+ 	if (ret)
+-		goto err_free_request_1;
++		goto err_free_request;
+ 
+ 	drm_crtc_helper_add(&ms912x->crtc, &ms912x_crtc_helper_funcs);
+ 
+ 	ret = ms912x_connector_init(ms912x);
+ 	if (ret)
+-		goto err_free_request_1;
++		goto err_free_request;
+ 
+ 	drm_mode_config_reset(dev);
+ 
+@@ -428,16 +393,16 @@ static int ms912x_usb_probe(struct usb_interface *interface,
+ 
+ 	ret = drm_dev_register(dev, 0);
+ 	if (ret)
+-		goto err_free_request_1;
++		goto err_free_request;
+ 
+ 	drm_client_setup(dev, NULL);
+ 
+ 	return 0;
+ 
+-err_free_request_1:
+-	ms912x_free_request(&ms912x->requests[1]);
+-err_free_request_0:
+-	ms912x_free_request(&ms912x->requests[0]);
++err_free_request:
++	ms912x_free_request(&ms912x->request);
++err_free_shadow:
++	vfree(ms912x->shadow);
+ 	return ret;
+ }
+ 
+@@ -448,9 +413,9 @@ static void ms912x_usb_disconnect(struct usb_interface *interface)
+ 
+ 	drm_dev_unplug(dev);
+ 	drm_atomic_helper_shutdown(dev);
+-	ms912x_cancel_transfer_work(ms912x);
+-	ms912x_free_request(&ms912x->requests[0]);
+-	ms912x_free_request(&ms912x->requests[1]);
++	cancel_work_sync(&ms912x->request.work);
++	ms912x_free_request(&ms912x->request);
++	vfree(ms912x->shadow);
+ }
+ 
+ static void ms912x_usb_shutdown(struct usb_interface *interface)
+diff --git a/ms912x_transfer.c b/ms912x_transfer.c
+index a5f9932..90d1731 100644
+--- a/ms912x_transfer.c
++++ b/ms912x_transfer.c
+@@ -2,13 +2,15 @@
+ 
+ #include <asm/byteorder.h>
+ #include <linux/align.h>
+-#include <linux/completion.h>
+ #include <linux/container_of.h>
+ #include <linux/dma-direction.h>
+ #include <linux/iosys-map.h>
+ #include <linux/jiffies.h>
++#include <linux/ktime.h>
++#include <linux/limits.h>
+ #include <linux/math.h>
+ #include <linux/minmax.h>
++#include <linux/mutex.h>
+ #include <linux/scatterlist.h>
+ #include <linux/slab.h>
+ #include <linux/string.h>
+@@ -26,6 +28,24 @@
+ 
+ #include "ms912x.h"
+ 
++static unsigned int debug;
++module_param(debug, uint, 0644);
++MODULE_PARM_DESC(debug, "Log framebuffer transfers");
++
++/*
++ * USB 2 cannot absorb every compositor frame. If the changed area is at
++ * least throttle_area pixels, wait up to throttle_ms for the transfer to
++ * finish instead of letting damage pile up and leave cursor/window trails.
++ * 0 disables the backpressure.
++ */
++static unsigned int throttle_area;
++module_param(throttle_area, uint, 0644);
++MODULE_PARM_DESC(throttle_area,
++		 "Changed pixels above which to throttle the compositor (0=off)");
++static unsigned int throttle_ms = 50;
++module_param(throttle_ms, uint, 0644);
++MODULE_PARM_DESC(throttle_ms, "Maximum backpressure wait in milliseconds");
++
+ static void ms912x_request_timeout(struct timer_list *t)
+ {
+ 	struct ms912x_usb_request *request = timer_container_of(request, t, timer);
+@@ -33,20 +53,55 @@ static void ms912x_request_timeout(struct timer_list *t)
+ 	usb_sg_cancel(&request->sgr);
+ }
+ 
+-static void ms912x_request_work(struct work_struct *work)
++static const u8 ms912x_end_of_buffer[] = { 0xff, 0xc0, 0x00, 0x00,
++				    0x00, 0x00, 0x00, 0x00 };
++
++void ms912x_clear_rect(struct drm_rect *rect)
++{
++	rect->x1 = INT_MAX;
++	rect->y1 = INT_MAX;
++	rect->x2 = 0;
++	rect->y2 = 0;
++}
++
++static void ms912x_xrgb_to_yuv422_line(u8 *transfer_buffer,
++				       const __le32 *temp_buffer, size_t width);
++
++/* Converts rect from the shadow buffer into a frame update. Returns its size. */
++static size_t ms912x_fill_transfer(void *dst, const void *shadow,
++				   const struct drm_rect *rect)
++{
++	struct ms912x_frame_update_header *header = dst;
++	int y, width = drm_rect_width(rect), height = drm_rect_height(rect);
++	u32 position, dimensions;
++
++	header->marker = cpu_to_be16(0xff00);
++	position = ((rect->x1 & 0xfff) << 12) | (rect->y1 & 0xfff);
++	dimensions = ((width & 0xfff) << 12) | (height & 0xfff);
++	put_unaligned_be24(position, header->position);
++	put_unaligned_be24(dimensions, header->dimensions);
++	dst += sizeof(*header);
++
++	for (y = rect->y1; y < rect->y2; y++) {
++		ms912x_xrgb_to_yuv422_line(dst, shadow + y * MS912X_SHADOW_PITCH +
++					   rect->x1 * 4, width);
++		dst += width * 2;
++	}
++
++	memcpy(dst, ms912x_end_of_buffer, sizeof(ms912x_end_of_buffer));
++	return width * 2 * height + MS912X_FRAME_OVERHEAD;
++}
++
++static int ms912x_send_request(struct ms912x_usb_request *request)
+ {
+-	struct ms912x_usb_request *request =
+-		container_of(work, struct ms912x_usb_request, work);
+ 	struct ms912x_device *ms912x = request->ms912x;
+ 	struct usb_device *usbdev = interface_to_usbdev(ms912x->intf);
+ 	struct usb_sg_request *sgr = &request->sgr;
+ 	struct sg_table *transfer_sgt = &request->transfer_sgt;
+ 	int idx, ret;
+ 
+-	if (!drm_dev_enter(&ms912x->drm, &idx)) {
+-		ret = -ENODEV;
+-		goto complete;
+-	}
++	if (!drm_dev_enter(&ms912x->drm, &idx))
++		return -ENODEV;
+ 
+ 	ret = usb_sg_init(sgr, usbdev, ms912x->bulk_pipe, 0, transfer_sgt->sgl,
+ 			  transfer_sgt->nents, request->transfer_len,
+@@ -66,11 +121,68 @@ static void ms912x_request_work(struct work_struct *work)
+ 
+ dev_exit:
+ 	drm_dev_exit(idx);
+-complete:
+-	if (ret < 0 && ret != -ENODEV)
+-		drm_err_ratelimited(&ms912x->drm,
+-				    "failed to send framebuffer: %d\n", ret);
+-	complete(&request->done);
++	return ret;
++}
++
++/*
++ * Sends damage accumulated in the shadow buffer until there is none left.
++ * Damage arriving during a transfer is merged and sent by the next loop, so
++ * nothing is dropped and the compositor never waits on USB.
++ */
++static void ms912x_request_work(struct work_struct *work)
++{
++	struct ms912x_usb_request *request =
++		container_of(work, struct ms912x_usb_request, work);
++	struct ms912x_device *ms912x = request->ms912x;
++	struct drm_rect rect, dirty;
++	ktime_t start, end;
++	int ret;
++
++	for (;;) {
++		mutex_lock(&ms912x->shadow_lock);
++		if (drm_rect_width(&ms912x->dirty_rect) <= 0 ||
++		    drm_rect_height(&ms912x->dirty_rect) <= 0) {
++			mutex_unlock(&ms912x->shadow_lock);
++			return;
++		}
++		dirty = ms912x->dirty_rect;
++
++		/*
++		 * The device double buffers, so also resend the last rect.
++		 * It updates the framebuffer in 16-pixel blocks.
++		 */
++		rect.x1 = ALIGN_DOWN(min(ms912x->dirty_rect.x1,
++					 ms912x->sent_rect.x1), 16);
++		rect.y1 = min(ms912x->dirty_rect.y1, ms912x->sent_rect.y1);
++		rect.x2 = min_t(int, ALIGN(max(ms912x->dirty_rect.x2,
++					       ms912x->sent_rect.x2), 16),
++				ms912x->fb_width);
++		rect.y2 = min(max(ms912x->dirty_rect.y2, ms912x->sent_rect.y2),
++			      ms912x->fb_height);
++		ms912x->sent_rect = ms912x->dirty_rect;
++		ms912x_clear_rect(&ms912x->dirty_rect);
++
++		request->transfer_len = ms912x_fill_transfer(
++			request->transfer_buffer, ms912x->shadow, &rect);
++		mutex_unlock(&ms912x->shadow_lock);
++
++		start = ktime_get();
++		ret = ms912x_send_request(request);
++		end = ktime_get();
++		if (debug)
++			drm_info(&ms912x->drm,
++				 "dirty %dx%d at %d,%d; send %dx%d at %d,%d; %zu bytes; %lld us\n",
++				 drm_rect_width(&dirty), drm_rect_height(&dirty),
++				 dirty.x1, dirty.y1,
++				 drm_rect_width(&rect), drm_rect_height(&rect),
++				 rect.x1, rect.y1, request->transfer_len,
++				 ktime_us_delta(end, start));
++		if (ret < 0 && ret != -ENODEV)
++			drm_err_ratelimited(&ms912x->drm,
++					    "failed to send framebuffer: %d\n",
++					    ret);
++		complete(&request->done);
++	}
+ }
+ 
+ void ms912x_free_request(struct ms912x_usb_request *request)
+@@ -116,7 +228,6 @@ int ms912x_init_request(struct ms912x_device *ms912x,
+ 	request->ms912x = ms912x;
+ 
+ 	init_completion(&request->done);
+-	complete(&request->done);
+ 	timer_setup(&request->timer, ms912x_request_timeout, 0);
+ 	INIT_WORK(&request->work, ms912x_request_work);
+ 	return 0;
+@@ -151,16 +262,13 @@ static inline unsigned int ms912x_rgb_to_v(unsigned int r, unsigned int g,
+ }
+ 
+ static void ms912x_xrgb_to_yuv422_line(u8 *transfer_buffer,
+-				       const struct iosys_map *xrgb_buffer,
+-				       size_t offset, size_t width,
+-				       __le32 *temp_buffer)
++				       const __le32 *temp_buffer, size_t width)
+ {
+ 	unsigned int i, dst_offset = 0;
+ 	unsigned int pixel1, pixel2;
+ 	unsigned int r1, g1, b1, r2, g2, b2;
+ 	unsigned int v, y1, u, y2;
+ 
+-	iosys_map_memcpy_from(temp_buffer, xrgb_buffer, offset, width * 4);
+ 	for (i = 0; i < width; i += 2) {
+ 		pixel1 = le32_to_cpup(&temp_buffer[i]);
+ 		pixel2 = le32_to_cpup(&temp_buffer[i + 1]);
+@@ -189,99 +297,85 @@ static void ms912x_xrgb_to_yuv422_line(u8 *transfer_buffer,
+ 	}
+ }
+ 
+-static const u8 ms912x_end_of_buffer[] = { 0xff, 0xc0, 0x00, 0x00,
+-				    0x00, 0x00, 0x00, 0x00 };
+-
+-static int ms912x_fb_xrgb8888_to_yuv422(void *dst,
+-					const struct iosys_map *src,
+-					struct drm_framebuffer *fb,
+-					const struct drm_rect *rect,
+-					struct drm_format_conv_state *fmtcnv_state)
++/*
++ * Copies damage into the shadow buffer and marks what really changed as dirty.
++ * Clients often report the whole window as damaged for a few changed pixels,
++ * and every byte counts on USB 2.
++ */
++int ms912x_fb_send_rect(struct drm_framebuffer *fb, const struct iosys_map *map,
++			struct drm_format_conv_state *fmtcnv_state,
++			struct drm_rect *rect)
+ {
+-	struct ms912x_frame_update_header *header = dst;
++	struct ms912x_device *ms912x = to_ms912x(fb->dev);
++	struct drm_rect *dirty = &ms912x->dirty_rect;
++	struct drm_rect changed;
+ 	struct iosys_map fb_map;
+-	u32 position, dimensions;
+-	int i, x, y1, y2, width;
+-	__le32 *temp_buffer;
++	__le32 *line, *old;
++	int ret, y, l, r, width;
+ 
+-	y1 = rect->y1;
+-	y2 = min_t(unsigned int, rect->y2, fb->height);
+-	x = rect->x1;
++	rect->x2 = min_t(int, rect->x2, fb->width);
++	rect->y2 = min_t(int, rect->y2, fb->height);
+ 	width = drm_rect_width(rect);
++	if (width <= 0)
++		return 0;
+ 
+-	temp_buffer = drm_format_conv_state_reserve(fmtcnv_state,
+-						    width * sizeof(*temp_buffer),
+-						    GFP_KERNEL);
+-	if (!temp_buffer)
++	line = drm_format_conv_state_reserve(fmtcnv_state,
++					     width * sizeof(*line), GFP_KERNEL);
++	if (!line)
+ 		return -ENOMEM;
+ 
+-	header->marker = cpu_to_be16(0xff00);
+-	position = ((x & 0xfff) << 12) | (y1 & 0xfff);
+-	dimensions = ((width & 0xfff) << 12) |
+-		     (drm_rect_height(rect) & 0xfff);
+-	put_unaligned_be24(position, header->position);
+-	put_unaligned_be24(dimensions, header->dimensions);
+-	dst += sizeof(*header);
++	ret = drm_gem_fb_begin_cpu_access(fb, DMA_FROM_DEVICE);
++	if (ret < 0)
++		return ret;
+ 
+-	fb_map = IOSYS_MAP_INIT_OFFSET(src, y1 * fb->pitches[0]);
+-	for (i = y1; i < y2; i++) {
+-		ms912x_xrgb_to_yuv422_line(dst, &fb_map, x * 4, width,
+-					   temp_buffer);
++	ms912x_clear_rect(&changed);
++	mutex_lock(&ms912x->shadow_lock);
++	fb_map = IOSYS_MAP_INIT_OFFSET(map, rect->y1 * fb->pitches[0]);
++	for (y = rect->y1; y < rect->y2; y++) {
++		iosys_map_memcpy_from(line, &fb_map, rect->x1 * 4, width * 4);
+ 		iosys_map_incr(&fb_map, fb->pitches[0]);
+-		dst += width * 2;
++		old = ms912x->shadow + y * MS912X_SHADOW_PITCH + rect->x1 * 4;
++
++		/* After a mode set the device content is unknown, send all. */
++		if (ms912x->shadow_valid) {
++			if (!memcmp(line, old, width * 4))
++				continue;
++			for (l = 0; line[l] == old[l]; l++)
++				;
++			for (r = width; line[r - 1] == old[r - 1]; r--)
++				;
++		} else {
++			l = 0;
++			r = width;
++		}
++
++		memcpy(old + l, line + l, (r - l) * 4);
++		changed.x1 = min(changed.x1, rect->x1 + l);
++		changed.x2 = max(changed.x2, rect->x1 + r);
++		changed.y1 = min(changed.y1, y);
++		changed.y2 = y + 1;
+ 	}
++	ms912x->shadow_valid = true;
+ 
+-	memcpy(dst, ms912x_end_of_buffer, sizeof(ms912x_end_of_buffer));
+-	return 0;
+-}
+-
+-int ms912x_fb_send_rect(struct drm_framebuffer *fb, const struct iosys_map *map,
+-			struct drm_format_conv_state *fmtcnv_state,
+-			struct drm_rect *rect)
+-{
+-	int ret = 0, idx;
+-	struct ms912x_device *ms912x = to_ms912x(fb->dev);
+-	struct drm_device *drm = &ms912x->drm;
+-	struct ms912x_usb_request *current_request;
+-	int x, width;
+-
+-	/* UYVY stores pixels in pairs. Expand damage to a complete pair. */
+-	x = ALIGN_DOWN(rect->x1, 2);
+-	width = min_t(int, ALIGN(rect->x2, 2), fb->width) - x;
+-	rect->x1 = x;
+-	rect->x2 = x + width;
+-	current_request = &ms912x->requests[ms912x->current_request];
+-
+-	if (!drm_dev_enter(drm, &idx))
+-		return -ENODEV;
+-
+-	/* Transfer buffer still in use, drop this frame. */
+-	if (!wait_for_completion_timeout(&current_request->done,
+-					 msecs_to_jiffies(10))) {
+-		ret = -ETIMEDOUT;
+-		goto dev_exit;
+-	}
+-
+-	ret = drm_gem_fb_begin_cpu_access(fb, DMA_FROM_DEVICE);
+-	if (ret < 0)
+-		goto request_complete;
+-
+-	ret = ms912x_fb_xrgb8888_to_yuv422(current_request->transfer_buffer,
+-					   map, fb, rect, fmtcnv_state);
++	dirty->x1 = min(dirty->x1, changed.x1);
++	dirty->y1 = min(dirty->y1, changed.y1);
++	dirty->x2 = max(dirty->x2, changed.x2);
++	dirty->y2 = max(dirty->y2, changed.y2);
++	ms912x->fb_width = fb->width;
++	ms912x->fb_height = fb->height;
++	mutex_unlock(&ms912x->shadow_lock);
+ 
+ 	drm_gem_fb_end_cpu_access(fb, DMA_FROM_DEVICE);
+-	if (ret < 0)
+-		goto request_complete;
+-
+-	current_request->transfer_len =
+-		width * 2 * drm_rect_height(rect) + MS912X_FRAME_OVERHEAD;
+-	queue_work(ms912x->workqueue, &current_request->work);
+-	ms912x->current_request = 1 - ms912x->current_request;
+-	goto dev_exit;
+-
+-request_complete:
+-	complete(&current_request->done);
+-dev_exit:
+-	drm_dev_exit(idx);
+-	return ret;
++	if (changed.y2) {
++		unsigned int area = drm_rect_width(&changed) *
++				    drm_rect_height(&changed);
++
++		reinit_completion(&ms912x->request.done);
++		queue_work(ms912x->workqueue, &ms912x->request.work);
++		if (throttle_area && area >= throttle_area)
++			wait_for_completion_timeout(
++				&ms912x->request.done,
++				msecs_to_jiffies(throttle_ms));
++	}
++	return 0;
+ }

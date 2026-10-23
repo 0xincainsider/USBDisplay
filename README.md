@@ -103,6 +103,14 @@ sudo ./Linux/install-ms912x.sh
 It detects the adapter on the bus and warns if an unsupported MS913x chip is
 present. After it finishes, configure the new output in *Settings → Displays*.
 
+On `kernel-7.2` the script also applies
+`Linux/patches/ms912x-kernel-7.2-fixes.patch`, which backports upstream
+PR #45 (shadow framebuffer with accumulated damage, so no frames are
+dropped), aligns damage to 16-pixel blocks and adds compositor backpressure
+to avoid cursor/window trails on USB 2.0. The backpressure settings are
+persisted in `/etc/modprobe.d/ms912x.conf` (`throttle_area=150000`,
+`throttle_ms=50`).
+
 ### Manual install on Arch Linux
 
 1. Install the build prerequisites:
@@ -140,10 +148,13 @@ present. After it finishes, configure the new output in *Settings → Displays*.
 
 ### Troubleshooting
 
-**Glitches in extended mode (none in mirror mode).** The driver can only
-update the framebuffer in multiples of 16 pixels. Resolutions that are not a
-multiple of 16 (e.g. 1366×768) show artifacts on the external display. Set the
-external display to a multiple of 16, e.g. **1280×720@60**.
+**Glitches / cursor trails in extended mode.** The patched `kernel-7.2`
+driver aligns damage to 16-pixel blocks and throttles the compositor when a
+large area changes, so fast mouse movement and window dragging do not pile up
+on the USB link. Tune `/etc/modprobe.d/ms912x.conf` (`throttle_area`,
+`throttle_ms`) if needed; `0` disables the backpressure. If a
+non-multiple-of-16 mode (e.g. 1366×768) still shows artifacts, use
+**1280×720@60**.
 
 **Mouse cursor invisible on the external display (GNOME Wayland).** The ms912x
 driver exposes no cursor plane, so the compositor must draw the cursor
@@ -153,6 +164,16 @@ Cursor) to force a software cursor, or use the **GNOME on Xorg** session
 
 **Module loads but no signal.** Check `dmesg | grep ms912x`, unplug/replug the
 adapter, and on X11 verify the output with `xrandr --listproviders`.
+
+**Adapter disappeared / `device descriptor read/64, error -71`.** The dongle
+firmware can wedge and stop answering USB requests (`-71` is `EPROTO`). It may
+still be powered from the port across warm reboots, so it never resets. Unplug
+the adapter for ~10 seconds and plug it back in; if the port keeps power on,
+do a full shutdown (or power-cycle the port, e.g. `uhubctl -l <bus> -p <port> -a cycle`).
+The same recovery applies when the module loads but logs
+`failed to send framebuffer: -71`. Re-run `Linux/install-ms912x.sh` to update
+to the latest driver, which serializes control transfers, keeps a shadow
+framebuffer so no damage is dropped, and handles USB reset/resume.
 
 ## FAQ
 
